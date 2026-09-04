@@ -125,20 +125,17 @@
   </div>
 
   <script>
-    // ================= 動態網址參數抓取 =================
+    // ================= 動態網址參數接收 =================
     const urlParams = new URLSearchParams(window.location.search);
-    const urlApi = urlParams.get('api'); // 接收 ?api=...
-    const urlKey = urlParams.get('key'); // 接收 ?key=...
+    const urlApi = urlParams.get('api');
+    const urlKey = urlParams.get('key');
 
-    // 若網址帶有參數，儲存至瀏覽器本機快取
     if (urlApi) localStorage.setItem("chat_api_url", decodeURIComponent(urlApi));
     if (urlKey) localStorage.setItem("chat_system_key", urlKey);
 
-    // 取得當前工作金鑰與 API 位址
     const API_URL = localStorage.getItem("chat_api_url") || "";
     const API_KEY = localStorage.getItem("chat_system_key") || "";
 
-    // 抹除網址列參數，保持網址整潔安全
     if (urlApi || urlKey) {
       window.history.replaceState({}, document.title, window.location.pathname);
     }
@@ -291,7 +288,7 @@
       box.scrollTop = box.scrollHeight;
     }
 
-    // 圖片選取
+    // 選取 PNG
     function previewImage(e) {
       const file = e.target.files[0];
       if (!file) return;
@@ -348,14 +345,13 @@
       }
     }
 
-    // 通用 POST 請求
+    // 通用 POST 請求工具 (修復 CORS 與 302 重導向)
     async function apiPost(data) {
       data.apiKey = API_KEY;
       try {
         const res = await fetch(API_URL, {
           method: "POST",
-          headers: { "Content-Type": "text/plain;charset=utf-8" },
-          body: JSON.stringify(data)
+          body: JSON.stringify(data) // 不加自訂 Request Header，相容 GAS 重導向
         });
         return await res.json();
       } catch (err) {
