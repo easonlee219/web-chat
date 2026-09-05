@@ -4,6 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>微型群組聊天室</title>
+  <!-- 引入 Supabase 官方客戶端 SDK -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #e2e8f0; margin: 0; padding: 20px 20px 80px 20px; display: flex; justify-content: center; }
@@ -36,7 +38,7 @@
     .chat-controls { display: flex; gap: 6px; padding: 8px 15px; background: #f1f5f9; border-bottom: 1px solid #cbd5e1; }
     .chat-controls input { padding: 6px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 13px; }
     .chat-box { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; background: #f8fafc; }
-    .msg-bubble { padding: 8px 12px; border-radius: 8px; max-width: 80%; background: #ffffff; border: 1px solid #e2e8f0; font-size: 14px; }
+    .msg-bubble { padding: 8px 12px; border-radius: 8px; max-width: 80%; background: #ffffff; border: 1px solid #e2e8f0; font-size: 14px; word-break: break-word; }
     .msg-bubble.self { align-self: flex-end; background: #dbeafe; border-color: #bfdbfe; }
     .msg-user { font-size: 11px; font-weight: bold; color: #64748b; margin-bottom: 2px; }
     .msg-img { max-width: 100%; border-radius: 6px; margin-top: 5px; display: block; }
@@ -125,31 +127,43 @@
   </div>
 
   <script>
-    // ================= 動態網址參數接收 =================
+    // ================= Supabase 設定與動態網址讀取 =================
+    const SUPABASE_URL = "https://gqxkgxnugfcduyrldjgr.supabase.co";
+
+    // 從網址讀取 key 參數，若有則永久記住
     const urlParams = new URLSearchParams(window.location.search);
-    const urlApi = urlParams.get('api');
     const urlKey = urlParams.get('key');
+    if (urlKey) localStorage.setItem("sb_anon_key", urlKey);
 
-    if (urlApi) localStorage.setItem("chat_api_url", decodeURIComponent(urlApi));
-    if (urlKey) localStorage.setItem("chat_system_key", urlKey);
+    const SUPABASE_KEY = localStorage.getItem("sb_anon_key") || "";
 
-    const API_URL = localStorage.getItem("chat_api_url") || "";
-    const API_KEY = localStorage.getItem("chat_system_key") || "";
-
-    if (urlApi || urlKey) {
+    // 清理網址列保持乾淨
+    if (urlKey) {
       window.history.replaceState({}, document.title, window.location.pathname);
+    }
+
+    let supabaseClient = null;
+    if (SUPABASE_KEY) {
+      supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     }
 
     let currentUser = localStorage.getItem("chat_user") || "";
     let currentRoom = "大廳";
-    let selectedImageBase64 = null;
-    let pollTimer = null;
+    let selectedImageFile = null;
+    let realtimeChannel = null;
     let errorTimeout = null;
 
-    // 啟動驗證權限
+    // 密碼 SHA-256 雜湊函式
+    async function hashPassword(str) {
+      const utf8 = new TextEncoder().encode(str);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', utf8);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
     window.addEventListener("DOMContentLoaded", () => {
-      if (!API_URL || !API_KEY) {
-        showBottomError("ERR_1001", "未授權存取：缺少 API 伺服器網址或通行金鑰，請透過專屬授權網址進入！");
+      if (!SUPABASE_KEY || !supabaseClient) {
+        showBottomError("ERR_1001", "未授權存取：缺少金鑰，請使用專屬連結進入 (?key=你的金鑰)");
         document.getElementById("loginBtn").disabled = true;
         document.getElementById("registerBtn").disabled = true;
       } else if (currentUser) {
@@ -182,18 +196,31 @@
       const p = document.getElementById("authPassword").value.trim();
       if (!u || !p) return showBottomError("ERR_2003", "請輸入帳號與密碼");
 
-      const res = await apiPost({ action: "login", username: u, password: p });
-      if (res.status === "success") {
-        currentUser = res.user;
-        localStorage.setItem("chat_user", currentUser);
-        hideBottomError();
-        showChat();
-      } else {
-        showBottomError(res.error_code || "ERR_9999", res.error_message || "登入失敗");
+      try {
+        const hashed = await hashPassword(p);
+        const { data, error } = await supabaseClient
+          .from('users')
+          .select('username')
+          .eq('username', u)
+          .eq('password_hash', hashed)
+          .maybeSingle();
+
+        if (error) throw error;
+
+        if (data) {
+          currentUser = data.username;
+          localStorage.setItem("chat_user", currentUser);
+          hideBottomError();
+          showChat();
+        } else {
+          showBottomError("ERR_2002", "登入失敗：帳號或密碼錯誤");
+        }
+      } catch (err) {
+        showBottomError("ERR_5002", "登入異常：" + err.message);
       }
     }
 
-    // 註冊 (攔截 ERR_2001)
+    // 註冊
     async function handleRegister() {
       clearInlineError();
       hideBottomError();
@@ -202,19 +229,32 @@
       const p = document.getElementById("authPassword").value.trim();
       if (!u || !p) return showBottomError("ERR_2003", "請輸入帳號與密碼");
 
-      const res = await apiPost({ action: "register", username: u, password: p });
+      try {
+        // 檢查是否重複註冊
+        const { data: existUser } = await supabaseClient
+          .from('users')
+          .select('username')
+          .eq('username', u)
+          .maybeSingle();
 
-      if (res.status === "success") {
-        alert("註冊成功！請直接點擊登入");
-      } else {
-        if (res.error_code === "ERR_2001") {
+        if (existUser) {
           const inlineErr = document.getElementById("authInlineError");
           inlineErr.innerText = "註冊時帳號名稱已被使用";
           inlineErr.style.display = "block";
           document.getElementById("authUsername").focus();
-        } else {
-          showBottomError(res.error_code || "ERR_9999", res.error_message || "註冊失敗");
+          return;
         }
+
+        const hashed = await hashPassword(p);
+        const { error } = await supabaseClient
+          .from('users')
+          .insert([{ username: u, password_hash: hashed }]);
+
+        if (error) throw error;
+
+        alert("註冊成功！請直接點擊登入");
+      } catch (err) {
+        showBottomError("ERR_9999", "註冊失敗：" + err.message);
       }
     }
 
@@ -223,14 +263,13 @@
       document.getElementById("chatSection").style.display = "flex";
       document.getElementById("currentUserLabel").innerText = `使用者: ${currentUser}`;
       loadMessages();
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(loadMessages, 3500);
+      listenRealtime();
     }
 
     function logout() {
       localStorage.removeItem("chat_user");
       currentUser = "";
-      clearInterval(pollTimer);
+      if (realtimeChannel) supabaseClient.removeChannel(realtimeChannel);
       document.getElementById("chatSection").style.display = "none";
       document.getElementById("authSection").style.display = "block";
       clearInlineError();
@@ -240,55 +279,72 @@
     function switchRoom() {
       currentRoom = document.getElementById("roomInput").value.trim() || "大廳";
       loadMessages();
+      listenRealtime();
     }
 
-    // 讀取訊息
+    // 讀取歷史訊息
     async function loadMessages() {
       try {
-        const url = `${API_URL}?apiKey=${encodeURIComponent(API_KEY)}&room=${encodeURIComponent(currentRoom)}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        
-        if (data.status === "success") {
-          renderMessages(data.messages);
-        } else {
-          showBottomError(data.error_code || "ERR_9999", data.error_message || "讀取訊息異常");
-        }
-      } catch (e) {
-        showBottomError("ERR_9999", "無法連線至後端伺服器");
+        const { data, error } = await supabaseClient
+          .from('messages')
+          .select('*')
+          .eq('room', currentRoom)
+          .order('id', { ascending: true })
+          .limit(50);
+
+        if (error) throw error;
+        renderMessages(data || []);
+      } catch (err) {
+        showBottomError("ERR_5002", "載入訊息異常: " + err.message);
       }
+    }
+
+    // WebSocket 秒級即時監聽 (0.1秒推播)
+    function listenRealtime() {
+      if (realtimeChannel) supabaseClient.removeChannel(realtimeChannel);
+
+      realtimeChannel = supabaseClient
+        .channel('public:messages')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, payload => {
+          if (payload.new && payload.new.room === currentRoom) {
+            appendSingleMessage(payload.new);
+          }
+        })
+        .subscribe();
     }
 
     function renderMessages(messages) {
       const box = document.getElementById("chatBox");
       box.innerHTML = "";
 
-      if (!messages || messages.length === 0) {
+      if (messages.length === 0) {
         box.innerHTML = `<div style="text-align:center;color:#94a3b8;font-size:12px;margin-top:20px;">群組「${currentRoom}」尚無訊息</div>`;
         return;
       }
 
-      messages.forEach(m => {
-        const isSelf = m.user === currentUser;
-        const bubble = document.createElement("div");
-        bubble.className = `msg-bubble ${isSelf ? 'self' : ''}`;
-        
-        let imgHtml = m.image ? `<a href="${m.image}" target="_blank"><img src="${m.image}" class="msg-img" alt="圖片"></a>` : "";
-        let timeStr = m.time ? new Date(m.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : "";
+      messages.forEach(m => appendSingleMessage(m));
+    }
 
-        bubble.innerHTML = `
-          <div class="msg-user">${m.user}</div>
-          <div>${m.msg}</div>
-          ${imgHtml}
-          <div class="msg-time">${timeStr}</div>
-        `;
-        box.appendChild(bubble);
-      });
+    function appendSingleMessage(m) {
+      const box = document.getElementById("chatBox");
+      const isSelf = m.username === currentUser;
+      const bubble = document.createElement("div");
+      bubble.className = `msg-bubble ${isSelf ? 'self' : ''}`;
+      
+      let imgHtml = m.image_url ? `<a href="${m.image_url}" target="_blank"><img src="${m.image_url}" class="msg-img" alt="圖片"></a>` : "";
+      let timeStr = m.created_at ? new Date(m.created_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : "";
 
+      bubble.innerHTML = `
+        <div class="msg-user">${m.username}</div>
+        <div>${m.message || ""}</div>
+        ${imgHtml}
+        <div class="msg-time">${timeStr}</div>
+      `;
+      box.appendChild(bubble);
       box.scrollTop = box.scrollHeight;
     }
 
-    // 選取 PNG
+    // 圖片選取驗證
     function previewImage(e) {
       const file = e.target.files[0];
       if (!file) return;
@@ -299,14 +355,10 @@
         return;
       }
 
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        selectedImageBase64 = evt.target.result;
-        document.getElementById("imagePreviewNote").style.display = "block";
-        document.getElementById("imagePreviewNote").innerText = `已選取 PNG (${Math.round(file.size / 1024)} KB)`;
-        hideBottomError();
-      };
-      reader.readAsDataURL(file);
+      selectedImageFile = file;
+      document.getElementById("imagePreviewNote").style.display = "block";
+      document.getElementById("imagePreviewNote").innerText = `已選取 PNG (${Math.round(file.size / 1024)} KB)`;
+      hideBottomError();
     }
 
     // 發送訊息
@@ -314,48 +366,54 @@
       const txtInput = document.getElementById("msgText");
       const msg = txtInput.value.trim();
 
-      if (!msg && !selectedImageBase64) {
+      if (!msg && !selectedImageFile) {
         return showBottomError("ERR_3001", "請輸入文字或選取圖片");
       }
 
       const btn = document.getElementById("sendBtn");
       btn.disabled = true;
 
-      const payload = {
-        action: "sendMessage",
-        user: currentUser,
-        room: currentRoom,
-        msg: msg,
-        image: selectedImageBase64
-      };
+      let uploadedImageUrl = null;
 
-      txtInput.value = "";
-      selectedImageBase64 = null;
-      document.getElementById("imageInput").value = "";
-      document.getElementById("imagePreviewNote").style.display = "none";
-
-      const res = await apiPost(payload);
-      btn.disabled = false;
-
-      if (res.status === "success") {
-        hideBottomError();
-        loadMessages();
-      } else {
-        showBottomError(res.error_code || "ERR_9999", res.error_message || "發送訊息失敗");
-      }
-    }
-
-    // 通用 POST 請求工具 (修復 CORS 與 302 重導向)
-    async function apiPost(data) {
-      data.apiKey = API_KEY;
       try {
-        const res = await fetch(API_URL, {
-          method: "POST",
-          body: JSON.stringify(data) // 不加自訂 Request Header，相容 GAS 重導向
-        });
-        return await res.json();
+        // 如果有選圖片，直傳 Supabase Storage
+        if (selectedImageFile) {
+          const fileName = `${Date.now()}_${Math.random().toString(36).substring(7)}.png`;
+          const { data: uploadData, error: uploadErr } = await supabaseClient.storage
+            .from('chat-images')
+            .upload(fileName, selectedImageFile, { contentType: 'image/png' });
+
+          if (uploadErr) throw uploadErr;
+
+          const { data: publicData } = supabaseClient.storage
+            .from('chat-images')
+            .getPublicUrl(fileName);
+
+          uploadedImageUrl = publicData.publicUrl;
+        }
+
+        // 寫入聊天訊息
+        const { error: insertErr } = await supabaseClient
+          .from('messages')
+          .insert([{
+            room: currentRoom,
+            username: currentUser,
+            message: msg,
+            image_url: uploadedImageUrl
+          }]);
+
+        if (insertErr) throw insertErr;
+
+        // 清空輸入框
+        txtInput.value = "";
+        selectedImageFile = null;
+        document.getElementById("imageInput").value = "";
+        document.getElementById("imagePreviewNote").style.display = "none";
+        hideBottomError();
       } catch (err) {
-        return { error_code: "ERR_9999", error_message: "連線異常: " + err.toString() };
+        showBottomError("ERR_9999", "發送失敗：" + err.message);
+      } finally {
+        btn.disabled = false;
       }
     }
   </script>
